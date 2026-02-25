@@ -30,8 +30,9 @@ struct JpegContext {
   int dstWidth;
   int dstHeight;
 
-  // Fine scale: maps from JPEGDEC-scaled source to final destination
-  float fineScale;
+  // Fine scale in 16.16 fixed-point (ESP32-C3 has no FPU)
+  int32_t fineScaleFP;  // src -> dst mapping
+  int32_t invScaleFP;   // dst -> src mapping
 
   PixelCache cache;
   bool caching;
@@ -45,7 +46,8 @@ struct JpegContext {
         scaledSrcHeight(0),
         dstWidth(0),
         dstHeight(0),
-        fineScale(1.0f),
+        fineScaleFP(1 << 16),
+        invScaleFP(1 << 16),
         caching(false) {}
 };
 
@@ -114,6 +116,11 @@ int chooseJpegScale(float targetScale, int& jpegScaleOption) {
   return 1;
 }
 
+// Fixed-point 16.16 arithmetic avoids software float emulation on ESP32-C3 (no FPU).
+constexpr int FP_SHIFT = 16;
+constexpr int32_t FP_ONE = 1 << FP_SHIFT;
+constexpr int32_t FP_MASK = FP_ONE - 1;
+
 int jpegDrawCallback(JPEGDRAW* pDraw) {
   JpegContext* ctx = reinterpret_cast<JpegContext*>(pDraw->pUser);
   if (!ctx || !ctx->config || !ctx->renderer) return 0;
@@ -121,76 +128,188 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   // In EIGHT_BIT_GRAYSCALE mode, pPixels contains 8-bit grayscale values
   // Buffer is densely packed: stride = pDraw->iWidth, valid columns = pDraw->iWidthUsed
   uint8_t* pixels = reinterpret_cast<uint8_t*>(pDraw->pPixels);
-  int stride = pDraw->iWidth;
-  int validW = pDraw->iWidthUsed;
-  int blockH = pDraw->iHeight;
+  const int stride = pDraw->iWidth;
+  const int validW = pDraw->iWidthUsed;
+  const int blockH = pDraw->iHeight;
 
   if (stride <= 0 || blockH <= 0 || validW <= 0) return 1;
 
-  bool useDithering = ctx->config->useDithering;
-  bool caching = ctx->caching;
-  float fineScale = ctx->fineScale;
-  float invScale = 1.0f / fineScale;
+  const bool useDithering = ctx->config->useDithering;
+  const bool caching = ctx->caching;
+  const int32_t fineScaleFP = ctx->fineScaleFP;
+  const int32_t invScaleFP = ctx->invScaleFP;
+  GfxRenderer& renderer = *ctx->renderer;
+  const int cfgX = ctx->config->x;
+  const int cfgY = ctx->config->y;
+  const int blockX = pDraw->x;
+  const int blockY = pDraw->y;
 
-  // Determine destination pixel range covered by this block
-  int srcYEnd = pDraw->y + blockH;
-  int srcXEnd = pDraw->x + validW;
+  // Determine destination pixel range covered by this source block
+  const int srcYEnd = blockY + blockH;
+  const int srcXEnd = blockX + validW;
 
-  int dstYStart = (int)(pDraw->y * fineScale);
-  int dstYEnd = (srcYEnd >= ctx->scaledSrcHeight) ? ctx->dstHeight : (int)(srcYEnd * fineScale);
+  int dstYStart = (int)((int64_t)blockY * fineScaleFP >> FP_SHIFT);
+  int dstYEnd = (srcYEnd >= ctx->scaledSrcHeight) ? ctx->dstHeight : (int)((int64_t)srcYEnd * fineScaleFP >> FP_SHIFT);
+  int dstXStart = (int)((int64_t)blockX * fineScaleFP >> FP_SHIFT);
+  int dstXEnd = (srcXEnd >= ctx->scaledSrcWidth) ? ctx->dstWidth : (int)((int64_t)srcXEnd * fineScaleFP >> FP_SHIFT);
 
-  int dstXStart = (int)(pDraw->x * fineScale);
-  int dstXEnd = (srcXEnd >= ctx->scaledSrcWidth) ? ctx->dstWidth : (int)(srcXEnd * fineScale);
+  // Pre-clamp destination ranges to screen bounds (eliminates per-pixel screen checks)
+  int clampYMax = ctx->dstHeight;
+  if (ctx->screenHeight - cfgY < clampYMax) clampYMax = ctx->screenHeight - cfgY;
+  if (dstYStart < -cfgY) dstYStart = -cfgY;
+  if (dstYEnd > clampYMax) dstYEnd = clampYMax;
 
-  // Use bilinear interpolation when upscaling (e.g. progressive JPEG DC-only at 1/8).
-  // Smooths block boundaries that would otherwise create visible banding.
-  bool bilinear = (fineScale > 1.0f);
+  int clampXMax = ctx->dstWidth;
+  if (ctx->screenWidth - cfgX < clampXMax) clampXMax = ctx->screenWidth - cfgX;
+  if (dstXStart < -cfgX) dstXStart = -cfgX;
+  if (dstXEnd > clampXMax) dstXEnd = clampXMax;
 
-  for (int dstY = dstYStart; dstY < dstYEnd && dstY < ctx->dstHeight; dstY++) {
-    int outY = ctx->config->y + dstY;
-    if (outY < 0 || outY >= ctx->screenHeight) continue;
+  if (dstYStart >= dstYEnd || dstXStart >= dstXEnd) return 1;
 
-    float srcFy = dstY * invScale;
-    int sy0 = (int)srcFy;
-    float fy = srcFy - sy0;
-    int ly0 = sy0 - pDraw->y;
-    int ly1 = ly0 + 1;
-    if (ly0 < 0) ly0 = 0;
-    if (ly0 >= blockH) ly0 = blockH - 1;
-    if (ly1 >= blockH) ly1 = blockH - 1;
+  // === 1:1 fast path: no scaling math ===
+  if (fineScaleFP == FP_ONE) {
+    for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
+      const int outY = cfgY + dstY;
+      const uint8_t* row = &pixels[(dstY - blockY) * stride];
+      for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
+        const int outX = cfgX + dstX;
+        uint8_t gray = row[dstX - blockX];
+        uint8_t dithered;
+        if (useDithering) {
+          dithered = applyBayerDither4Level(gray, outX, outY);
+        } else {
+          dithered = gray / 85;
+          if (dithered > 3) dithered = 3;
+        }
+        drawPixelWithRenderMode(renderer, outX, outY, dithered);
+        if (caching) ctx->cache.setPixel(outX, outY, dithered);
+      }
+    }
+    return 1;
+  }
 
-    for (int dstX = dstXStart; dstX < dstXEnd && dstX < ctx->dstWidth; dstX++) {
-      int outX = ctx->config->x + dstX;
-      if (outX < 0 || outX >= ctx->screenWidth) continue;
+  // === Bilinear interpolation (upscale: fineScale > 1.0) ===
+  // Smooths block boundaries that would otherwise create visible banding
+  // on progressive JPEG DC-only decode (1/8 resolution upscaled to target).
+  if (fineScaleFP > FP_ONE) {
+    // Pre-compute safe X range where lx0 and lx0+1 are both in [0, validW-1].
+    // Only the left/right edge pixels (typically 0-2 and 1-8 respectively) need clamping.
+    int safeXStart = (int)(((int64_t)blockX * fineScaleFP + FP_MASK) >> FP_SHIFT);
+    int safeXEnd = (int)((int64_t)(blockX + validW - 1) * fineScaleFP >> FP_SHIFT);
+    if (safeXStart < dstXStart) safeXStart = dstXStart;
+    if (safeXEnd > dstXEnd) safeXEnd = dstXEnd;
+    if (safeXStart > safeXEnd) safeXEnd = safeXStart;
 
-      float srcFx = dstX * invScale;
-      uint8_t gray;
+    for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
+      const int outY = cfgY + dstY;
+      const int32_t srcFyFP = dstY * invScaleFP;
+      const int32_t fy = srcFyFP & FP_MASK;
+      const int32_t fyInv = FP_ONE - fy;
+      int ly0 = (srcFyFP >> FP_SHIFT) - blockY;
+      int ly1 = ly0 + 1;
+      if (ly0 < 0) ly0 = 0;
+      if (ly0 >= blockH) ly0 = blockH - 1;
+      if (ly1 >= blockH) ly1 = blockH - 1;
 
-      if (bilinear) {
-        // Bilinear interpolation: blend 4 nearest source pixels
-        int sx0 = (int)srcFx;
-        float fx = srcFx - sx0;
-        int lx0 = sx0 - pDraw->x;
+      const uint8_t* row0 = &pixels[ly0 * stride];
+      const uint8_t* row1 = &pixels[ly1 * stride];
+
+      // Left edge (with X boundary clamping)
+      for (int dstX = dstXStart; dstX < safeXStart; dstX++) {
+        const int outX = cfgX + dstX;
+        const int32_t srcFxFP = dstX * invScaleFP;
+        const int32_t fx = srcFxFP & FP_MASK;
+        const int32_t fxInv = FP_ONE - fx;
+        int lx0 = (srcFxFP >> FP_SHIFT) - blockX;
         int lx1 = lx0 + 1;
         if (lx0 < 0) lx0 = 0;
+        if (lx1 < 0) lx1 = 0;
         if (lx0 >= validW) lx0 = validW - 1;
         if (lx1 >= validW) lx1 = validW - 1;
 
-        uint8_t p00 = pixels[ly0 * stride + lx0];
-        uint8_t p10 = pixels[ly0 * stride + lx1];
-        uint8_t p01 = pixels[ly1 * stride + lx0];
-        uint8_t p11 = pixels[ly1 * stride + lx1];
+        int top = ((int)row0[lx0] * fxInv + (int)row0[lx1] * fx) >> FP_SHIFT;
+        int bot = ((int)row1[lx0] * fxInv + (int)row1[lx1] * fx) >> FP_SHIFT;
+        uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        float top = p00 + fx * (p10 - p00);
-        float bot = p01 + fx * (p11 - p01);
-        gray = (uint8_t)(top + fy * (bot - top));
-      } else {
-        // Nearest-neighbor for downscale / 1:1
-        int col = (int)srcFx - pDraw->x;
-        if (col < 0) col = 0;
-        if (col >= validW) col = validW - 1;
-        gray = pixels[ly0 * stride + col];
+        uint8_t dithered;
+        if (useDithering) {
+          dithered = applyBayerDither4Level(gray, outX, outY);
+        } else {
+          dithered = gray / 85;
+          if (dithered > 3) dithered = 3;
+        }
+        drawPixelWithRenderMode(renderer, outX, outY, dithered);
+        if (caching) ctx->cache.setPixel(outX, outY, dithered);
       }
+
+      // Interior (no X boundary checks — lx0 and lx0+1 guaranteed in bounds)
+      for (int dstX = safeXStart; dstX < safeXEnd; dstX++) {
+        const int outX = cfgX + dstX;
+        const int32_t srcFxFP = dstX * invScaleFP;
+        const int32_t fx = srcFxFP & FP_MASK;
+        const int32_t fxInv = FP_ONE - fx;
+        const int lx0 = (srcFxFP >> FP_SHIFT) - blockX;
+
+        int top = ((int)row0[lx0] * fxInv + (int)row0[lx0 + 1] * fx) >> FP_SHIFT;
+        int bot = ((int)row1[lx0] * fxInv + (int)row1[lx0 + 1] * fx) >> FP_SHIFT;
+        uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
+
+        uint8_t dithered;
+        if (useDithering) {
+          dithered = applyBayerDither4Level(gray, outX, outY);
+        } else {
+          dithered = gray / 85;
+          if (dithered > 3) dithered = 3;
+        }
+        drawPixelWithRenderMode(renderer, outX, outY, dithered);
+        if (caching) ctx->cache.setPixel(outX, outY, dithered);
+      }
+
+      // Right edge (with X boundary clamping)
+      for (int dstX = safeXEnd; dstX < dstXEnd; dstX++) {
+        const int outX = cfgX + dstX;
+        const int32_t srcFxFP = dstX * invScaleFP;
+        const int32_t fx = srcFxFP & FP_MASK;
+        const int32_t fxInv = FP_ONE - fx;
+        int lx0 = (srcFxFP >> FP_SHIFT) - blockX;
+        int lx1 = lx0 + 1;
+        if (lx0 >= validW) lx0 = validW - 1;
+        if (lx1 >= validW) lx1 = validW - 1;
+
+        int top = ((int)row0[lx0] * fxInv + (int)row0[lx1] * fx) >> FP_SHIFT;
+        int bot = ((int)row1[lx0] * fxInv + (int)row1[lx1] * fx) >> FP_SHIFT;
+        uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
+
+        uint8_t dithered;
+        if (useDithering) {
+          dithered = applyBayerDither4Level(gray, outX, outY);
+        } else {
+          dithered = gray / 85;
+          if (dithered > 3) dithered = 3;
+        }
+        drawPixelWithRenderMode(renderer, outX, outY, dithered);
+        if (caching) ctx->cache.setPixel(outX, outY, dithered);
+      }
+    }
+    return 1;
+  }
+
+  // === Nearest-neighbor (downscale: fineScale < 1.0) ===
+  for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
+    const int outY = cfgY + dstY;
+    const int32_t srcFyFP = dstY * invScaleFP;
+    int ly = (srcFyFP >> FP_SHIFT) - blockY;
+    if (ly < 0) ly = 0;
+    if (ly >= blockH) ly = blockH - 1;
+    const uint8_t* row = &pixels[ly * stride];
+
+    for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
+      const int outX = cfgX + dstX;
+      const int32_t srcFxFP = dstX * invScaleFP;
+      int lx = (srcFxFP >> FP_SHIFT) - blockX;
+      if (lx < 0) lx = 0;
+      if (lx >= validW) lx = validW - 1;
+      uint8_t gray = row[lx];
 
       uint8_t dithered;
       if (useDithering) {
@@ -199,7 +318,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         dithered = gray / 85;
         if (dithered > 3) dithered = 3;
       }
-      drawPixelWithRenderMode(*ctx->renderer, outX, outY, dithered);
+      drawPixelWithRenderMode(renderer, outX, outY, dithered);
       if (caching) ctx->cache.setPixel(outX, outY, dithered);
     }
   }
@@ -323,10 +442,12 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   ctx.scaledSrcHeight = (srcHeight + jpegScaleDenom - 1) / jpegScaleDenom;
   ctx.dstWidth = destWidth;
   ctx.dstHeight = destHeight;
-  ctx.fineScale = (float)destWidth / ctx.scaledSrcWidth;
+  ctx.fineScaleFP = (int32_t)((int64_t)destWidth * FP_ONE / ctx.scaledSrcWidth);
+  ctx.invScaleFP = (int32_t)((int64_t)ctx.scaledSrcWidth * FP_ONE / destWidth);
 
   LOG_DBG("JPG", "JPEG %dx%d -> %dx%d (scale %.2f, jpegScale 1/%d, fineScale %.2f)%s", srcWidth, srcHeight, destWidth,
-          destHeight, targetScale, jpegScaleDenom, ctx.fineScale, isProgressive ? " [progressive]" : "");
+          destHeight, targetScale, jpegScaleDenom, (float)destWidth / ctx.scaledSrcWidth,
+          isProgressive ? " [progressive]" : "");
 
   // Set pixel type to 8-bit grayscale (must be after open())
   jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
