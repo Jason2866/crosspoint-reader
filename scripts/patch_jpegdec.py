@@ -20,7 +20,7 @@ Both patches are applied idempotently so it is safe to run on every build.
 Import("env")
 import os
 
-def patch_jpegdec(source, target, env):
+def patch_jpegdec(env):
     # Find the JPEGDEC library in libdeps
     libdeps_dir = os.path.join(env["PROJECT_DIR"], ".pio", "libdeps")
     if not os.path.isdir(libdeps_dir):
@@ -111,4 +111,7 @@ def _apply_mcu_skip_patch(filepath):
         f.write(content)
     print("Patched JPEGDEC: guard pMCU writes for MCU_SKIP in JPEGDecodeMCU_P: %s" % filepath)
 
-env.AddPreAction("buildprog", patch_jpegdec)
+# Apply patches immediately when this pre: script runs, before compilation starts.
+# Previously used env.AddPreAction("buildprog", ...) which deferred patching until
+# the link step — after the library was already compiled from unpatched source.
+patch_jpegdec(env)
