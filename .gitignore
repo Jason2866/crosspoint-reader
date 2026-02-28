@@ -1,4 +1,6 @@
 .pio
+.dummy
+managed_components
 .idea
 .DS_Store
 .vscode
@@ -15,3 +17,6 @@ build
 .history/
 /.venv
 *.local*
+dependencies.lock
+sdkconfig*
+CMakeLists.txt

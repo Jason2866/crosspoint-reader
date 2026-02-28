@@ -138,27 +138,27 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
     float ratio = static_cast<float>(bitmap.getWidth()) / static_cast<float>(bitmap.getHeight());
     const float screenRatio = static_cast<float>(pageWidth) / static_cast<float>(pageHeight);
 
-    LOG_DBG("SLP", "bitmap ratio: %f, screen ratio: %f", ratio, screenRatio);
+    LOG_DBG("SLP", "bitmap ratio: %d/1000, screen ratio: %d/1000", (int)(ratio * 1000), (int)(screenRatio * 1000));
     if (ratio > screenRatio) {
       // image wider than viewport ratio, scaled down image needs to be centered vertically
       if (SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP) {
         cropX = 1.0f - (screenRatio / ratio);
-        LOG_DBG("SLP", "Cropping bitmap x: %f", cropX);
+        LOG_DBG("SLP", "Cropping bitmap x: %d/1000", (int)(cropX * 1000));
         ratio = (1.0f - cropX) * static_cast<float>(bitmap.getWidth()) / static_cast<float>(bitmap.getHeight());
       }
       x = 0;
       y = std::round((static_cast<float>(pageHeight) - static_cast<float>(pageWidth) / ratio) / 2);
-      LOG_DBG("SLP", "Centering with ratio %f to y=%d", ratio, y);
+      LOG_DBG("SLP", "Centering with ratio %d/1000 to y=%d", (int)(ratio * 1000), y);
     } else {
       // image taller than viewport ratio, scaled down image needs to be centered horizontally
       if (SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP) {
         cropY = 1.0f - (ratio / screenRatio);
-        LOG_DBG("SLP", "Cropping bitmap y: %f", cropY);
+        LOG_DBG("SLP", "Cropping bitmap y: %d/1000", (int)(cropY * 1000));
         ratio = static_cast<float>(bitmap.getWidth()) / ((1.0f - cropY) * static_cast<float>(bitmap.getHeight()));
       }
       x = std::round((static_cast<float>(pageWidth) - static_cast<float>(pageHeight) * ratio) / 2);
       y = 0;
-      LOG_DBG("SLP", "Centering with ratio %f to x=%d", ratio, x);
+      LOG_DBG("SLP", "Centering with ratio %d/1000 to x=%d", (int)(ratio * 1000), x);
     }
   } else {
     // center the image
