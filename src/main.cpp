@@ -1,5 +1,4 @@
 #include <cstdarg>
-#include <reent.h>
 
 // Stubs for newlib nano: float printf/scanf not supported
 extern "C" int _printf_float(struct _reent*, void*, const char*, va_list*) { return 0; }
