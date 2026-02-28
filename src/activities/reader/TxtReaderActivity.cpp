@@ -487,9 +487,9 @@ void TxtReaderActivity::renderStatusBar(const int orientedMarginRight, const int
   if (showProgressText || showProgressPercentage || showBookPercentage) {
     char progressStr[32];
     if (showProgressPercentage) {
-      snprintf(progressStr, sizeof(progressStr), "%d/%d %.0f%%", currentPage + 1, totalPages, progress);
-    } else if (showBookPercentage) {
-      snprintf(progressStr, sizeof(progressStr), "%.0f%%", progress);
+      snprintf(progressStr, sizeof(progressStr), "%d/%d %d%%", currentPage + 1, totalPages, (int)progress);
+      } else if (showBookPercentage) {
+      snprintf(progressStr, sizeof(progressStr), "%d%%", (int)progress);
     } else {
       snprintf(progressStr, sizeof(progressStr), "%d/%d", currentPage + 1, totalPages);
     }
